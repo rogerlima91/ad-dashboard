@@ -105,7 +105,13 @@ SCOPES = [
 # Passing ttl=0 means it only re-fetches when cache is manually cleared (via the Refresh button).
 @st.cache_data(ttl=0)
 def load_data():
-    creds  = Credentials.from_service_account_file("credentials/google-credentials.json", scopes=SCOPES)
+    # Use Streamlit secrets when deployed on Streamlit Cloud,
+    # otherwise fall back to the local credentials file
+    if "gcp_service_account" in st.secrets:
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file("credentials/google-credentials.json", scopes=SCOPES)
+
     client = gspread.authorize(creds)
     ws     = client.open_by_key(SPREADSHEET_ID).get_worksheet(0)
 
