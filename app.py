@@ -1,8 +1,10 @@
+import io
 import streamlit as st
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import gspread
+from fpdf import FPDF
+from google.oauth2.service_account import Credentials
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Ad Dashboard", layout="wide")
@@ -92,23 +94,44 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Generate fake campaign data ───────────────────────────────────────────────
-@st.cache_data
+# ── Google Sheets connection ──────────────────────────────────────────────────
+SPREADSHEET_ID = "1Y7YAD9HbM8VCJzEhjH0rhusF0jRqM8iVuiI_nX4Wch0"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+# Cache the data so the sheet isn't re-fetched on every interaction.
+# Passing ttl=0 means it only re-fetches when cache is manually cleared (via the Refresh button).
+@st.cache_data(ttl=0)
 def load_data():
-    np.random.seed(42)
-    campaigns = ["Brand Awareness", "Retargeting", "Prospecting", "Seasonal Sale", "Product Launch"]
-    df = pd.DataFrame({
-        "campaign":    np.random.choice(campaigns, 50),
-        "impressions": np.random.randint(5000, 100000, 50),
-        "clicks":      np.random.randint(50, 2000, 50),
-        "spend_usd":   np.round(np.random.uniform(50, 1500, 50), 2),
-    })
-    df["clicks"]  = df[["clicks", "impressions"]].min(axis=1)
-    df["ctr"]     = df["clicks"] / df["impressions"]
-    df["cpm"]     = df["spend_usd"] / df["impressions"] * 1000
+    creds  = Credentials.from_service_account_file("credentials/google-credentials.json", scopes=SCOPES)
+    client = gspread.authorize(creds)
+    ws     = client.open_by_key(SPREADSHEET_ID).get_worksheet(0)
+
+    # Row 0 has placeholder letters (A, B, C…) — row 1 has the real column headers
+    all_values = ws.get_all_values()
+    df = pd.DataFrame(all_values[2:], columns=all_values[1])
+
+    # Convert numeric columns from strings (Sheets returns everything as text)
+    for col in ["impressions", "clicks", "spend_usd"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Calculate CTR and CPM
+    df["ctr"] = df["clicks"] / df["impressions"]
+    df["cpm"] = df["spend_usd"] / df["impressions"] * 1000
+
     return df
 
-df = load_data()
+# ── Sidebar — Refresh button ──────────────────────────────────────────────────
+# This is placed before load_data() is called so the button clears the cache first
+st.sidebar.header("Filters")
+if st.sidebar.button("🔄 Refresh data"):
+    st.cache_data.clear()
+
+# ── Load data with a spinner ──────────────────────────────────────────────────
+with st.spinner("Loading data from Google Sheets…"):
+    df = load_data()
 
 # ── Helper: apply clean chart style to any axis ───────────────────────────────
 def style_ax(ax):
@@ -131,7 +154,6 @@ with col_logo:
     )
 
 # ── Sidebar filter ────────────────────────────────────────────────────────────
-st.sidebar.header("Filters")
 campaign_options  = ["All"] + sorted(df["campaign"].unique().tolist())
 selected_campaign = st.sidebar.selectbox("Select Campaign", campaign_options)
 
@@ -183,6 +205,12 @@ with pie_col:
     ax.set_title("CTR Share by Campaign", fontsize=11, fontweight="bold", color=DV_NAVY, pad=10)
     plt.tight_layout()
     st.pyplot(fig)
+
+    # Save figure to buffer so we can offer it as a JPEG download later
+    buf_pie = io.BytesIO()
+    fig.savefig(buf_pie, format="jpeg", dpi=150, bbox_inches="tight")
+    buf_pie.seek(0)
+    plt.close(fig)
 
 # -- CPM best / worst table --
 with cpm_col:
@@ -240,6 +268,12 @@ style_ax(ax2)
 plt.tight_layout()
 st.pyplot(fig2)
 
+# Save figure to buffer so we can offer it as a JPEG download later
+buf_spend = io.BytesIO()
+fig2.savefig(buf_spend, format="jpeg", dpi=150, bbox_inches="tight")
+buf_spend.seek(0)
+plt.close(fig2)
+
 # ── Insights ──────────────────────────────────────────────────────────────────
 st.subheader("Campaign Insights")
 
@@ -286,3 +320,114 @@ display_df["spend_usd"] = display_df["spend_usd"].map("${:,.0f}".format)
 display_df.columns      = ["Campaign", "Impressions", "Clicks", "Spend", "CTR", "CPM"]
 
 st.dataframe(display_df, use_container_width=True)
+
+# ── Downloads ─────────────────────────────────────────────────────────────────
+st.subheader("Downloads")
+
+# -- PDF builder: summary metrics + full data table --
+def build_pdf(df_raw, metrics):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(20, 17, 59)   # DV Navy
+    pdf.cell(0, 12, "Ad Tech Campaign Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(107, 114, 128)
+    pdf.cell(0, 6, "Powered by DoubleVerify", ln=True, align="C")
+    pdf.ln(6)
+
+    # Summary metrics
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(20, 17, 59)
+    pdf.cell(0, 8, "Summary Metrics", ln=True)
+    pdf.set_draw_color(0, 178, 169)   # DV Cyan
+    pdf.set_line_width(0.5)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(55, 65, 81)
+    for label, value in metrics.items():
+        pdf.cell(60, 7, label, border=0)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, value, ln=True)
+        pdf.set_font("Helvetica", "", 10)
+    pdf.ln(6)
+
+    # Data table
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(20, 17, 59)
+    pdf.cell(0, 8, "Campaign Data", ln=True)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    cols     = df_raw.columns.tolist()
+    col_w    = 185 / len(cols)
+
+    # Header row
+    pdf.set_fill_color(20, 17, 59)    # DV Navy background
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 8)
+    for col in cols:
+        pdf.cell(col_w, 8, col, border=0, fill=True, align="C")
+    pdf.ln()
+
+    # Data rows — alternate light background for readability
+    pdf.set_font("Helvetica", "", 8)
+    for i, (_, row) in enumerate(df_raw.iterrows()):
+        if i % 2 == 0:
+            pdf.set_fill_color(244, 246, 251)   # soft blue-grey
+            pdf.set_text_color(55, 65, 81)
+            fill = True
+        else:
+            pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(55, 65, 81)
+            fill = True
+        for val in row:
+            pdf.cell(col_w, 7, str(val), border=0, fill=fill, align="C")
+        pdf.ln()
+
+    return bytes(pdf.output())
+
+# Build PDF bytes
+metrics_dict = {
+    "Total Impressions": f"{total_impressions:,}",
+    "Total Clicks":      f"{total_clicks:,}",
+    "Total Spend":       f"${total_spend:,.0f}",
+    "Avg CTR":           f"{avg_ctr:.2%}",
+    "Avg CPM":           f"${avg_cpm:,.0f}",
+}
+pdf_bytes = build_pdf(display_df, metrics_dict)
+
+# Three download buttons side by side
+dl1, dl2, dl3 = st.columns(3)
+
+with dl1:
+    st.download_button(
+        label="📄 Download Data (PDF)",
+        data=pdf_bytes,
+        file_name="campaign_report.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+with dl2:
+    st.download_button(
+        label="🖼 Download CTR Chart (JPEG)",
+        data=buf_pie,
+        file_name="ctr_chart.jpeg",
+        mime="image/jpeg",
+        use_container_width=True,
+    )
+
+with dl3:
+    st.download_button(
+        label="🖼 Download Spend Chart (JPEG)",
+        data=buf_spend,
+        file_name="spend_chart.jpeg",
+        mime="image/jpeg",
+        use_container_width=True,
+    )
